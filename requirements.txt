@@ -7,3 +7,6 @@ plotly
 requests
 beautifulsoup4
 scikit-learn
+matplotlib
+scipy
+Pillow
