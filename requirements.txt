@@ -1,0 +1,9 @@
+streamlit
+pandas
+yfinance
+numpy
+lightgbm
+plotly
+requests
+beautifulsoup4
+scikit-learn
