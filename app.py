@@ -49,7 +49,7 @@ HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
-DATA_DIR = "/content/stock_data"
+DATA_DIR = "stock_data_cache"
 os.makedirs(DATA_DIR, exist_ok=True)
 SUMMARY_FILE = os.path.join(DATA_DIR, "liquidity_sweep_summary.csv")
 TIMESTAMP_FILE = os.path.join(DATA_DIR, "last_simulation_timestamp.txt")
