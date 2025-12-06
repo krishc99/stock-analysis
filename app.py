@@ -1,4 +1,3 @@
-%%writefile app.py
 """
 Smarter Support/Resistance + Pattern detection Streamlit app — single-file fixed + ML classifier.
 This version integrates the FINAL Mind-Free, High-Accuracy EMA Pullback Signal.
