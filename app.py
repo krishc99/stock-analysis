@@ -202,16 +202,20 @@ def detect_ema_pullback_with_state(hist: pd.DataFrame,
                     position_active[i] = False
                     exit_type[i] = 'Stop'
 
-            # Check for NEW ENTRY
-            if prev_signal and not current_in_trade:
-                buy_signal[i] = True
-                current_entry = current_open
-                current_in_trade = True
-                entry_price[i] = current_entry
-                target_price[i] = current_entry * (1 + target_profit_pct / 100)
-                stop_price[i] = current_entry * (1 - stop_loss_pct / 100)
+            # --- REVISED SECTION IN detect_ema_pullback_with_state ---
 
-            position_active[i] = current_in_trade
+            # Replace the existing "Check for NEW ENTRY" block with this:
+            if prev_signal:
+                buy_signal[i] = True  # Always record the signal
+                
+                # Only reset entry/target/stop if NOT currently in a trade 
+                # OR if you want the newest signal to overwrite the old levels:
+                if not current_in_trade:
+                    current_entry = current_open
+                    current_in_trade = True
+                    entry_price[i] = current_entry
+                    target_price[i] = current_entry * (1 + target_profit_pct / 100)
+                    stop_price[i] = current_entry * (1 - stop_loss_pct / 100)
 
         # Add columns to dataframe
         hist['Pullback_Signal'] = buy_signal
