@@ -22,6 +22,9 @@ import time
 from bs4 import BeautifulSoup
 from nsepy import get_history
 from plotly.subplots import make_subplots
+from newsapi import NewsApiClient
+import re
+import html
 
 # sklearn imports guarded by try/except to show friendly message if missing
 try:
@@ -64,6 +67,404 @@ logging.basicConfig(
 )
 
 logging.info("Streamlit app has started")
+
+def scrape_google_news(ticker: str, num_articles: int = 15) -> List[Dict[str, Any]]:
+    """
+    Scrapes recent news from Google News RSS feed.
+    Fetches extra articles to account for duplicates that will be removed later.
+    """
+    try:
+        import feedparser
+        
+        clean_ticker = ticker.replace('.NS', '').replace('.BO', '')
+        
+        url = f'https://news.google.com/rss/search?q={clean_ticker}+stock&hl=en-IN&gl=IN&ceid=IN:en'
+        
+        feed = feedparser.parse(url)
+        articles = []
+        
+        for entry in feed.entries[:num_articles]:
+            pub_date = datetime(*entry.published_parsed[:6]) if hasattr(entry, 'published_parsed') else datetime.now()
+            
+            title = entry.title
+            source = 'Google News'
+            
+            if ' - ' in title:
+                parts = title.rsplit(' - ', 1)
+                if len(parts) == 2:
+                    title = parts[0].strip()
+                    source = parts[1].strip()
+            
+            description = None
+            
+            if hasattr(entry, 'summary') and entry.summary:
+                soup = BeautifulSoup(entry.summary, 'html.parser')
+                text_content = soup.get_text(separator=' ', strip=True)
+                
+                if text_content.startswith(entry.title):
+                    text_content = text_content[len(entry.title):].strip()
+                
+                if source in text_content:
+                    text_content = text_content.replace(source, '').strip()
+                
+                if text_content and len(text_content) > 20:
+                    description = text_content
+            
+            if not description or len(description) < 20:
+                description = f"Read the latest news about {clean_ticker} stock."
+            
+            description = ' '.join(description.split())
+            if len(description) > 300:
+                description = description[:297] + '...'
+            
+            articles.append({
+                'title': clean_html_text(title),
+                'description': description,
+                'url': entry.link,
+                'source': {'name': source},
+                'publishedAt': pub_date.strftime('%Y-%m-%d %H:%M:%S'),
+                'sentiment': None,
+                'news_source': 'Google'  # Track which scraper found this
+            })
+        
+        return articles
+    
+    except Exception as e:
+        logging.error(f"Error scraping Google News: {e}")
+        return []
+
+
+def scrape_bing_news(ticker: str, num_articles: int = 15) -> List[Dict[str, Any]]:
+    """
+    Scrapes news from Bing News search (better descriptions than Google News RSS).
+    Fetches extra articles to account for duplicates that will be removed later.
+    """
+    try:
+        from urllib.parse import quote
+        
+        clean_ticker = ticker.replace('.NS', '').replace('.BO', '')
+        search_query = quote(f'{clean_ticker} stock news')
+        
+        url = f'https://www.bing.com/news/search?q={search_query}&format=rss'
+        
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(response.content, 'xml')
+        
+        articles = []
+        items = soup.find_all('item')[:num_articles]
+        
+        for item in items:
+            title = item.find('title').text if item.find('title') else 'No title'
+            description = item.find('description').text if item.find('description') else ''
+            link = item.find('link').text if item.find('link') else ''
+            pub_date = item.find('pubDate').text if item.find('pubDate') else ''
+            source = item.find('source').text if item.find('source') else 'Bing News'
+            
+            # Clean description
+            description = clean_html_text(description)
+            if not description or len(description) < 20:
+                description = f"Latest update on {clean_ticker}. Click to read the full article."
+            
+            # Parse date
+            try:
+                if pub_date:
+                    # Bing uses RFC 2822 format
+                    dt = datetime.strptime(pub_date, '%a, %d %b %Y %H:%M:%S %Z')
+                    pub_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    pub_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                try:
+                    # Try alternative format
+                    dt = datetime.strptime(pub_date.split(' GMT')[0], '%a, %d %b %Y %H:%M:%S')
+                    pub_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    pub_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            articles.append({
+                'title': clean_html_text(title),
+                'description': description,
+                'url': link,
+                'source': {'name': source},
+                'publishedAt': pub_date,
+                'sentiment': None,
+                'news_source': 'Bing'  # Track which scraper found this
+            })
+        
+        return articles
+    
+    except Exception as e:
+        logging.error(f"Error scraping Bing News: {e}")
+        return []
+
+
+def fetch_stock_news(ticker: str, api_key: Optional[str] = None, num_articles: int = 10) -> List[Dict[str, Any]]:
+    """
+    Fetches recent news about a stock using multiple sources and combines them.
+    Priority: NewsAPI > Combined (Bing News + Google News)
+    """
+    clean_ticker = ticker.replace('.NS', '').replace('.BO', '').replace('.', '')
+    all_articles = []
+    
+    # Try NewsAPI first if key is provided
+    if api_key:
+        try:
+            newsapi = NewsApiClient(api_key=api_key)
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=7)
+            
+            response = newsapi.get_everything(
+                q=f'{clean_ticker} stock',
+                from_param=from_date.strftime('%Y-%m-%d'),
+                to=to_date.strftime('%Y-%m-%d'),
+                language='en',
+                sort_by='publishedAt',
+                page_size=num_articles
+            )
+            
+            if response['status'] == 'ok' and response.get('articles'):
+                return response['articles'][:num_articles]
+        
+        except Exception as e:
+            logging.warning(f"NewsAPI fetch failed: {e}. Falling back to free sources.")
+    
+    # Fetch from Bing News
+    try:
+        bing_articles = scrape_bing_news(clean_ticker, num_articles)
+        if bing_articles:
+            all_articles.extend(bing_articles)
+            logging.info(f"Fetched {len(bing_articles)} articles from Bing News")
+    except Exception as e:
+        logging.warning(f"Bing News scraping failed: {e}")
+    
+    # Fetch from Google News
+    try:
+        google_articles = scrape_google_news(clean_ticker, num_articles)
+        if google_articles:
+            all_articles.extend(google_articles)
+            logging.info(f"Fetched {len(google_articles)} articles from Google News")
+    except Exception as e:
+        logging.warning(f"Google News scraping failed: {e}")
+    
+    # Remove duplicates based on title similarity
+    unique_articles = remove_duplicate_articles(all_articles)
+    
+    # Sort by date (newest first)
+    unique_articles.sort(key=lambda x: x.get('publishedAt', ''), reverse=True)
+    
+    # Return top N articles
+    return unique_articles[:num_articles]
+
+
+def remove_duplicate_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Removes duplicate articles based on title similarity.
+    Uses fuzzy matching to catch near-duplicates.
+    """
+    if not articles:
+        return []
+    
+    unique = []
+    seen_titles = []
+    
+    for article in articles:
+        title = article.get('title', '').lower().strip()
+        
+        # Skip if title is too short or empty
+        if len(title) < 10:
+            continue
+        
+        # Check for exact or near-duplicate
+        is_duplicate = False
+        for seen_title in seen_titles:
+            # Simple similarity check: if 80% of words match, consider duplicate
+            title_words = set(title.split())
+            seen_words = set(seen_title.split())
+            
+            if not title_words or not seen_words:
+                continue
+            
+            overlap = len(title_words & seen_words)
+            similarity = overlap / max(len(title_words), len(seen_words))
+            
+            if similarity > 0.8:  # 80% similarity threshold
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            unique.append(article)
+            seen_titles.append(title)
+    
+    return unique
+
+
+def analyze_news_sentiment(text: str) -> Dict[str, Any]:
+    """
+    Simple sentiment analysis using keyword matching.
+    For production, consider using TextBlob or a proper NLP model.
+    """
+    if not text:
+        return {'score': 0, 'label': 'Neutral'}
+    
+    text_lower = text.lower()
+    
+    # Positive keywords
+    positive_words = ['gain', 'profit', 'surge', 'rally', 'bullish', 'growth', 
+                     'upgrade', 'beat', 'strong', 'positive', 'outperform',
+                     'expansion', 'success', 'breakthrough', 'record']
+    
+    # Negative keywords
+    negative_words = ['loss', 'drop', 'fall', 'decline', 'bearish', 'downgrade',
+                     'miss', 'weak', 'negative', 'underperform', 'layoff',
+                     'lawsuit', 'investigation', 'fraud', 'crash']
+    
+    pos_count = sum(1 for word in positive_words if word in text_lower)
+    neg_count = sum(1 for word in negative_words if word in text_lower)
+    
+    # Calculate sentiment score
+    total = pos_count + neg_count
+    if total == 0:
+        return {'score': 0, 'label': 'Neutral', 'confidence': 0.5}
+    
+    score = (pos_count - neg_count) / total
+    
+    if score > 0.3:
+        label = '🟢 Positive'
+        confidence = min(0.5 + (score * 0.5), 1.0)
+    elif score < -0.3:
+        label = '🔴 Negative'
+        confidence = min(0.5 + (abs(score) * 0.5), 1.0)
+    else:
+        label = '🟡 Neutral'
+        confidence = 0.5
+    
+    return {'score': score, 'label': label, 'confidence': confidence}
+
+
+def display_news_section(ticker: str, news_api_key: Optional[str] = None):
+    """
+    Displays a formatted news section in Streamlit with combined sources.
+    """
+    st.subheader(f'📰 Recent News for {ticker}')
+    
+    with st.spinner('Fetching latest news from multiple sources...'):
+        articles = fetch_stock_news(ticker, api_key=news_api_key, num_articles=10)
+    
+    if not articles:
+        st.warning('No recent news found for this stock.')
+        return
+    
+    # Show source breakdown
+    bing_count = sum(1 for a in articles if a.get('news_source') == 'Bing')
+    google_count = sum(1 for a in articles if a.get('news_source') == 'Google')
+    newsapi_count = sum(1 for a in articles if a.get('news_source') not in ['Bing', 'Google'])
+    
+    st.caption(f"📊 Sources: Bing News ({bing_count}) • Google News ({google_count})" + 
+               (f" • NewsAPI ({newsapi_count})" if newsapi_count > 0 else ""))
+    
+    # Analyze sentiment for each article
+    for article in articles:
+        title = clean_html_text(article.get('title', ''))
+        description = clean_html_text(article.get('description', ''))
+        
+        article['title'] = title
+        article['description'] = description
+        
+        combined_text = f"{title} {description}"
+        sentiment = analyze_news_sentiment(combined_text)
+        article['sentiment'] = sentiment
+    
+    # Calculate overall sentiment
+    avg_sentiment = sum(a['sentiment']['score'] for a in articles) / len(articles)
+    
+    # Display overall sentiment metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric('Total Articles', len(articles))
+    with col2:
+        sentiment_label = '🟢 Positive' if avg_sentiment > 0.2 else '🔴 Negative' if avg_sentiment < -0.2 else '🟡 Neutral'
+        st.metric('Overall Sentiment', sentiment_label)
+    with col3:
+        positive_count = sum(1 for a in articles if a['sentiment']['score'] > 0.3)
+        st.metric('Positive News', f"{positive_count}/{len(articles)}")
+    
+    st.markdown('---')
+    
+    # Display articles
+    for i, article in enumerate(articles, 1):
+        title = article.get('title', 'No title')
+        
+        # Add source badge to title
+        news_source_badge = ""
+        if article.get('news_source') == 'Bing':
+            news_source_badge = " 🅱️"
+        elif article.get('news_source') == 'Google':
+            news_source_badge = " 🔍"
+        
+        with st.expander(f"📄 {title}{news_source_badge}", expanded=(i <= 3)):
+            
+            # Sentiment badge
+            sentiment = article['sentiment']
+            st.markdown(f"**Sentiment:** {sentiment['label']} (Score: {sentiment['score']:.2f})")
+            
+            # Article details
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                source = article.get('source', 'Unknown')
+                if isinstance(source, dict):
+                    source = source.get('name', 'Unknown')
+                st.markdown(f"**Source:** {source}")
+                
+                if article.get('publishedAt'):
+                    pub_date = article['publishedAt']
+                    if isinstance(pub_date, str):
+                        try:
+                            if 'T' in pub_date:
+                                pub_date = datetime.strptime(pub_date.split('.')[0], '%Y-%m-%d %H:%M:%S').strftime('%B %d, %Y at %I:%M %p')
+                            else:
+                                pub_date = datetime.strptime(pub_date, '%Y-%m-%d %H:%M:%S').strftime('%B %d, %Y at %I:%M %p')
+                        except:
+                            pub_date = pub_date.split('T')[0] if 'T' in pub_date else pub_date
+                    st.markdown(f"**Published:** {pub_date}")
+            
+            with col2:
+                if article.get('url'):
+                    st.markdown(f"[🔗 Read More]({article['url']})")
+            
+            # Description
+            description = article.get('description', 'No description available.')
+            if description and description != 'No description available.' and len(description) > 10:
+                if len(description) > 500:
+                    description = description[:497] + '...'
+                st.markdown(f"_{description}_")
+            
+            st.markdown('---')
+
+# Add this helper function after the imports section
+def clean_html_text(text: str) -> str:
+    """
+    Removes HTML tags and decodes HTML entities from text.
+    """
+    if not text:
+        return "No description available"
+    
+    try:
+        # Decode HTML entities (e.g., &lt; becomes <)
+        text = html.unescape(text)
+        
+        # Remove HTML tags using BeautifulSoup
+        soup = BeautifulSoup(text, 'html.parser')
+        clean_text = soup.get_text(separator=' ', strip=True)
+        
+        # Remove extra whitespace
+        clean_text = ' '.join(clean_text.split())
+        
+        return clean_text if clean_text else "No description available"
+    
+    except Exception as e:
+        logging.error(f"Error cleaning HTML text: {e}")
+        return "No description available"
 
 # --- New Function: EMA Pullback Signal ---
 
@@ -2673,6 +3074,20 @@ def main() -> None:
             hist = add_features(hist)
             hist['ATR'] = compute_atr(hist)
             #hist = detect_ema_pullback_with_state(hist, target_profit_pct=10.0)
+
+            # ===== NEWS SECTION =====
+            st.markdown('---')
+            st.subheader('📰 Latest News & Sentiment Analysis')
+
+            # Optional: Add NewsAPI key input in sidebar
+            news_api_key = st.sidebar.text_input(
+                'NewsAPI Key (optional)', 
+                type='password',
+                help='Get free key from https://newsapi.org - Leave empty to use Google News scraper'
+            )
+
+            display_news_section(ticker, news_api_key if news_api_key else None)
+            st.markdown('---')
 
             # Compute Support/Resistance levels and inject into hist
             hist = compute_avg_support_resistance(hist, lookback=10, confirm_touches=2)
