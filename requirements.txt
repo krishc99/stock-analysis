@@ -11,3 +11,5 @@ matplotlib
 scipy
 Pillow
 nsepy
+newsapi-python
+feedparser
