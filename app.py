@@ -198,12 +198,178 @@ def scrape_bing_news(ticker: str, num_articles: int = 15) -> List[Dict[str, Any]
         return []
 
 
+def calculate_article_relevance(article: Dict[str, Any], 
+                                target_ticker: str,
+                                company_name: Optional[str] = None) -> float:
+    """
+    Calculate how relevant an article is to the target ticker.
+    NOW INCLUDES EXCHANGE AND COMPANY NAME VALIDATION!
+    
+    Returns a score from 0.0 (not relevant) to 1.0 (highly relevant).
+    """
+    score = 0.0
+    base_ticker, target_exchange = extract_exchange_from_ticker(target_ticker)
+    
+    title = article.get('title', '').upper()
+    description = article.get('description', '').upper()
+    source = article.get('source', {})
+    if isinstance(source, dict):
+        source_name = source.get('name', '').upper()
+    else:
+        source_name = str(source).upper()
+    
+    full_text = f"{title} {description} {source_name}"
+    
+    # ==========================================
+    # EXCHANGE VALIDATION (Critical!)
+    # ==========================================
+    
+    # Check if article mentions wrong exchange
+    wrong_exchange_indicators = {
+        'NSE': ['ASX', 'AUSTRALIA', 'SYDNEY', 'LSE', 'LONDON', 'NYSE:', 'NASDAQ:'],
+        'BSE': ['ASX', 'AUSTRALIA', 'SYDNEY', 'LSE', 'LONDON', 'NYSE:', 'NASDAQ:'],
+        'US': ['NSE', 'BSE', 'MUMBAI', 'INDIA', 'ASX', 'AUSTRALIA', 'LSE', 'LONDON'],
+        'ASX': ['NSE', 'BSE', 'MUMBAI', 'INDIA', 'NYSE:', 'NASDAQ:', 'LSE', 'LONDON'],
+    }
+    
+    # If article mentions wrong exchange, return very low score
+    if target_exchange in wrong_exchange_indicators:
+        for wrong_indicator in wrong_exchange_indicators[target_exchange]:
+            if wrong_indicator in full_text:
+                logging.info(f"Article mentions wrong exchange '{wrong_indicator}' for {target_ticker}")
+                return 0.05  # Very low relevance score
+    
+    # Boost score if article mentions correct exchange
+    correct_exchange_indicators = {
+        'NSE': ['NSE', 'NATIONAL STOCK EXCHANGE', 'MUMBAI', 'INDIA', 'INDIAN STOCK'],
+        'BSE': ['BSE', 'BOMBAY STOCK EXCHANGE', 'MUMBAI', 'INDIA', 'INDIAN STOCK'],
+        'US': ['NYSE', 'NASDAQ', 'S&P 500', 'DOW JONES', 'WALL STREET', 'US STOCK'],
+        'ASX': ['ASX', 'AUSTRALIAN STOCK', 'SYDNEY', 'AUSTRALIA'],
+    }
+    
+    if target_exchange in correct_exchange_indicators:
+        for correct_indicator in correct_exchange_indicators[target_exchange]:
+            if correct_indicator in full_text:
+                score += 0.15  # Bonus for mentioning correct exchange
+                break
+    
+    # ==========================================
+    # COMPANY NAME MATCHING (More Reliable!)
+    # ==========================================
+    
+    if company_name:
+        # Check if company name appears in title or description
+        if company_name in title:
+            score += 0.4  # Strong signal
+        elif company_name in description:
+            score += 0.25  # Good signal
+        
+        # Check for partial company name matches (e.g., "ABB India" vs "ABB Australia")
+        company_words = company_name.split()
+        if len(company_words) > 1:
+            # Multi-word company names are more specific
+            matching_words = sum(1 for word in company_words if word in title)
+            if matching_words >= len(company_words) * 0.6:  # 60% of words match
+                score += 0.2
+    
+    # ==========================================
+    # TICKER MATCHING (Less Reliable Alone)
+    # ==========================================
+    
+    # Title relevance
+    if base_ticker in title:
+        # Check if ticker is in first half of title (more prominent)
+        title_position = title.find(base_ticker) / max(len(title), 1)
+        if title_position < 0.3:
+            score += 0.3  # Prominent in title
+        else:
+            score += 0.2  # Mentioned in title
+    
+    # Description relevance
+    if base_ticker in description:
+        desc_position = description.find(base_ticker) / max(len(description), 1)
+        if desc_position < 0.2:
+            score += 0.2  # Early in description
+        else:
+            score += 0.1  # Mentioned in description
+    
+    # Count how many times the ticker appears
+    ticker_count_title = title.count(base_ticker)
+    ticker_count_desc = description.count(base_ticker)
+    
+    if ticker_count_title >= 2:
+        score += 0.1
+    if ticker_count_desc >= 2:
+        score += 0.05
+    
+    # ==========================================
+    # MULTI-COMPANY PENALTY
+    # ==========================================
+    
+    # Penalty for articles that mention many other company names
+    common_tickers = ['APPLE', 'GOOGLE', 'AMAZON', 'MICROSOFT', 'META', 
+                     'TESLA', 'NVIDIA', 'ALPHABET', 'RELIANCE', 'TCS',
+                     'INFOSYS', 'WIPRO', 'HDFC', 'ICICI']
+    
+    other_ticker_count = sum(1 for t in common_tickers 
+                            if t != base_ticker and t in full_text)
+    
+    if other_ticker_count >= 4:
+        score *= 0.3  # Severe penalty for market roundup articles
+    elif other_ticker_count >= 3:
+        score *= 0.5  # Strong penalty
+    elif other_ticker_count >= 2:
+        score *= 0.7  # Moderate penalty
+    
+    return min(score, 1.0)
+
+
+def filter_relevant_articles(articles: List[Dict[str, Any]], 
+                            target_ticker: str, 
+                            min_relevance: float = 0.3) -> List[Dict[str, Any]]:
+    """
+    Filter articles based on relevance to the target ticker.
+    NOW WITH COMPANY NAME LOOKUP!
+    """
+    # Get company name once for all articles
+    company_name = get_company_name_from_ticker(target_ticker)
+    base_ticker, exchange = extract_exchange_from_ticker(target_ticker)
+    
+    if company_name:
+        logging.info(f"Filtering news for {company_name} ({base_ticker}, {exchange})")
+    else:
+        logging.warning(f"Could not get company name for {target_ticker}, using ticker only")
+    
+    scored_articles = []
+    
+    for article in articles:
+        relevance = calculate_article_relevance(article, target_ticker, company_name)
+        if relevance >= min_relevance:
+            article['relevance_score'] = relevance
+            scored_articles.append(article)
+        else:
+            # Log why article was filtered out for debugging
+            logging.debug(f"Filtered out article (relevance {relevance:.2f}): {article.get('title', 'No title')[:50]}")
+    
+    # Sort by relevance score (highest first)
+    scored_articles.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+    
+    return scored_articles
+
+
 def fetch_stock_news(ticker: str, api_key: Optional[str] = None, num_articles: int = 10) -> List[Dict[str, Any]]:
     """
     Fetches recent news about a stock using multiple sources and combines them.
-    Priority: NewsAPI > Combined (Bing News + Google News)
+    NOW WITH EXCHANGE VALIDATION AND COMPANY NAME MATCHING!
     """
-    clean_ticker = ticker.replace('.NS', '').replace('.BO', '').replace('.', '')
+    base_ticker, exchange = extract_exchange_from_ticker(ticker)
+    
+    # Get company name for better matching
+    company_name = get_company_name_from_ticker(ticker)
+    
+    # Use company name in search if available, otherwise use ticker
+    search_term = company_name if company_name else base_ticker
+    
     all_articles = []
     
     # Try NewsAPI first if key is provided
@@ -213,24 +379,40 @@ def fetch_stock_news(ticker: str, api_key: Optional[str] = None, num_articles: i
             to_date = datetime.now()
             from_date = to_date - timedelta(days=7)
             
+            # Add exchange context to search
+            if exchange in ['NSE', 'BSE']:
+                search_query = f'{search_term} India stock'
+            elif exchange == 'ASX':
+                search_query = f'{search_term} Australia stock'
+            else:
+                search_query = f'{search_term} stock'
+            
             response = newsapi.get_everything(
-                q=f'{clean_ticker} stock',
+                q=search_query,
                 from_param=from_date.strftime('%Y-%m-%d'),
                 to=to_date.strftime('%Y-%m-%d'),
                 language='en',
                 sort_by='publishedAt',
-                page_size=num_articles
+                page_size=num_articles * 2
             )
             
             if response['status'] == 'ok' and response.get('articles'):
-                return response['articles'][:num_articles]
+                all_articles.extend(response['articles'][:num_articles * 2])
         
         except Exception as e:
             logging.warning(f"NewsAPI fetch failed: {e}. Falling back to free sources.")
     
     # Fetch from Bing News
     try:
-        bing_articles = scrape_bing_news(clean_ticker, num_articles)
+        # Add exchange context
+        if exchange in ['NSE', 'BSE']:
+            search_term_bing = f'{base_ticker} India'
+        elif exchange == 'ASX':
+            search_term_bing = f'{base_ticker} Australia'
+        else:
+            search_term_bing = base_ticker
+            
+        bing_articles = scrape_bing_news(search_term_bing, num_articles * 2)
         if bing_articles:
             all_articles.extend(bing_articles)
             logging.info(f"Fetched {len(bing_articles)} articles from Bing News")
@@ -239,21 +421,150 @@ def fetch_stock_news(ticker: str, api_key: Optional[str] = None, num_articles: i
     
     # Fetch from Google News
     try:
-        google_articles = scrape_google_news(clean_ticker, num_articles)
+        # Add exchange context
+        if exchange in ['NSE', 'BSE']:
+            search_term_google = f'{base_ticker} India'
+        elif exchange == 'ASX':
+            search_term_google = f'{base_ticker} Australia'
+        else:
+            search_term_google = base_ticker
+            
+        google_articles = scrape_google_news(search_term_google, num_articles * 2)
         if google_articles:
             all_articles.extend(google_articles)
             logging.info(f"Fetched {len(google_articles)} articles from Google News")
     except Exception as e:
         logging.warning(f"Google News scraping failed: {e}")
     
-    # Remove duplicates based on title similarity
+    # Remove duplicates
     unique_articles = remove_duplicate_articles(all_articles)
     
-    # Sort by date (newest first)
-    unique_articles.sort(key=lambda x: x.get('publishedAt', ''), reverse=True)
+    # **Filter for relevance WITH exchange validation**
+    relevant_articles = filter_relevant_articles(unique_articles, ticker, min_relevance=0.3)
     
-    # Return top N articles
-    return unique_articles[:num_articles]
+    logging.info(f"Filtered to {len(relevant_articles)} relevant articles from {len(unique_articles)} unique articles for {ticker}")
+    
+    # Sort by date (newest first)
+    relevant_articles.sort(key=lambda x: x.get('publishedAt', ''), reverse=True)
+    
+    return relevant_articles[:num_articles]
+
+
+def display_news_section(ticker: str, news_api_key: Optional[str] = None):
+    """
+    Displays a formatted news section in Streamlit.
+    NOW WITH EXCHANGE INFO!
+    """
+    base_ticker, exchange = extract_exchange_from_ticker(ticker)
+    company_name = get_company_name_from_ticker(ticker)
+    
+    if company_name:
+        st.subheader(f'📰 Recent News for {company_name} ({base_ticker}, {exchange})')
+    else:
+        st.subheader(f'📰 Recent News for {base_ticker} ({exchange})')
+    
+    with st.spinner('Fetching latest news from multiple sources...'):
+        articles = fetch_stock_news(ticker, api_key=news_api_key, num_articles=10)
+    
+    if not articles:
+        st.warning(f'No relevant news found for {base_ticker} on {exchange} exchange.')
+        return
+    
+    # Show source breakdown
+    bing_count = sum(1 for a in articles if a.get('news_source') == 'Bing')
+    google_count = sum(1 for a in articles if a.get('news_source') == 'Google')
+    newsapi_count = sum(1 for a in articles if a.get('news_source') not in ['Bing', 'Google'])
+    
+    st.caption(f"📊 Sources: Bing News ({bing_count}) • Google News ({google_count})" + 
+               (f" • NewsAPI ({newsapi_count})" if newsapi_count > 0 else ""))
+    
+    # Show average relevance
+    avg_relevance = sum(a.get('relevance_score', 0) for a in articles) / len(articles) if articles else 0
+    st.caption(f"🎯 Average Relevance Score: {avg_relevance:.2f} | 🌍 Exchange: {exchange}")
+    
+    # Analyze sentiment for each article
+    for article in articles:
+        title = clean_html_text(article.get('title', ''))
+        description = clean_html_text(article.get('description', ''))
+        
+        article['title'] = title
+        article['description'] = description
+        
+        combined_text = f"{title} {description}"
+        sentiment = analyze_news_sentiment(combined_text)
+        article['sentiment'] = sentiment
+    
+    # Calculate overall sentiment
+    avg_sentiment = sum(a['sentiment']['score'] for a in articles) / len(articles)
+    
+    # Display overall sentiment metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric('Total Articles', len(articles))
+    with col2:
+        sentiment_label = '🟢 Positive' if avg_sentiment > 0.2 else '🔴 Negative' if avg_sentiment < -0.2 else '🟡 Neutral'
+        st.metric('Overall Sentiment', sentiment_label)
+    with col3:
+        positive_count = sum(1 for a in articles if a['sentiment']['score'] > 0.3)
+        st.metric('Positive News', f"{positive_count}/{len(articles)}")
+    with col4:
+        st.metric('Avg Relevance', f"{avg_relevance:.2f}")
+    
+    st.markdown('---')
+    
+    # Display articles
+    for i, article in enumerate(articles, 1):
+        title = article.get('title', 'No title')
+        relevance = article.get('relevance_score', 0)
+        
+        # Add source badge to title
+        news_source_badge = ""
+        if article.get('news_source') == 'Bing':
+            news_source_badge = " 🅱️"
+        elif article.get('news_source') == 'Google':
+            news_source_badge = " 🔍"
+        
+        # Add relevance indicator to title
+        relevance_indicator = "🎯🎯🎯" if relevance > 0.7 else "🎯🎯" if relevance > 0.5 else "🎯"
+        
+        with st.expander(f"📄 {relevance_indicator} {title}{news_source_badge}", expanded=(i <= 3)):
+            
+            # Show relevance score
+            st.markdown(f"**Relevance:** {relevance:.2f} | **Sentiment:** {article['sentiment']['label']} (Score: {article['sentiment']['score']:.2f})")
+            
+            # Article details
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                source = article.get('source', 'Unknown')
+                if isinstance(source, dict):
+                    source = source.get('name', 'Unknown')
+                st.markdown(f"**Source:** {source}")
+                
+                if article.get('publishedAt'):
+                    pub_date = article['publishedAt']
+                    if isinstance(pub_date, str):
+                        try:
+                            if 'T' in pub_date:
+                                pub_date = datetime.strptime(pub_date.split('.')[0], '%Y-%m-%d %H:%M:%S').strftime('%B %d, %Y at %I:%M %p')
+                            else:
+                                pub_date = datetime.strptime(pub_date, '%Y-%m-%d %H:%M:%S').strftime('%B %d, %Y at %I:%M %p')
+                        except:
+                            pub_date = pub_date.split('T')[0] if 'T' in pub_date else pub_date
+                    st.markdown(f"**Published:** {pub_date}")
+            
+            with col2:
+                if article.get('url'):
+                    st.markdown(f"[🔗 Read More]({article['url']})")
+            
+            # Description
+            description = article.get('description', 'No description available.')
+            if description and description != 'No description available.' and len(description) > 10:
+                if len(description) > 500:
+                    description = description[:497] + '...'
+                st.markdown(f"_{description}_")
+            
+            st.markdown('---')
 
 
 def remove_duplicate_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -340,106 +651,64 @@ def analyze_news_sentiment(text: str) -> Dict[str, Any]:
     
     return {'score': score, 'label': label, 'confidence': confidence}
 
+def get_company_name_from_ticker(ticker: str) -> Optional[str]:
+    """
+    Fetch the actual company name for a ticker to improve matching accuracy.
+    Caches results to avoid repeated API calls.
+    """
+    try:
+        # Try to get company info from yfinance
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        # Get long name or short name
+        company_name = info.get('longName') or info.get('shortName')
+        
+        if company_name:
+            return company_name.upper()
+        
+    except Exception as e:
+        logging.warning(f"Could not fetch company name for {ticker}: {e}")
+    
+    return None
 
-def display_news_section(ticker: str, news_api_key: Optional[str] = None):
+
+def extract_exchange_from_ticker(ticker: str) -> Tuple[str, str]:
     """
-    Displays a formatted news section in Streamlit with combined sources.
+    Extract the base ticker and exchange suffix.
+    
+    Returns:
+    --------
+    Tuple of (base_ticker, exchange)
+    
+    Examples:
+    ---------
+    'RELIANCE.NS' -> ('RELIANCE', 'NSE')
+    'ABB.NS' -> ('ABB', 'NSE')
+    'ABB.AX' -> ('ABB', 'ASX')
+    'AAPL' -> ('AAPL', 'US')
     """
-    st.subheader(f'📰 Recent News for {ticker}')
+    ticker = ticker.upper().strip()
     
-    with st.spinner('Fetching latest news from multiple sources...'):
-        articles = fetch_stock_news(ticker, api_key=news_api_key, num_articles=10)
+    # Map of exchange suffixes to exchange names
+    exchange_map = {
+        '.NS': 'NSE',
+        '.BO': 'BSE',
+        '.AX': 'ASX',  # Australia
+        '.L': 'LSE',   # London
+        '.TO': 'TSX',  # Toronto
+        '.HK': 'HKEX', # Hong Kong
+        '.T': 'TSE',   # Tokyo
+        '.SI': 'SGX',  # Singapore
+    }
     
-    if not articles:
-        st.warning('No recent news found for this stock.')
-        return
+    for suffix, exchange in exchange_map.items():
+        if ticker.endswith(suffix):
+            base_ticker = ticker.replace(suffix, '')
+            return base_ticker, exchange
     
-    # Show source breakdown
-    bing_count = sum(1 for a in articles if a.get('news_source') == 'Bing')
-    google_count = sum(1 for a in articles if a.get('news_source') == 'Google')
-    newsapi_count = sum(1 for a in articles if a.get('news_source') not in ['Bing', 'Google'])
-    
-    st.caption(f"📊 Sources: Bing News ({bing_count}) • Google News ({google_count})" + 
-               (f" • NewsAPI ({newsapi_count})" if newsapi_count > 0 else ""))
-    
-    # Analyze sentiment for each article
-    for article in articles:
-        title = clean_html_text(article.get('title', ''))
-        description = clean_html_text(article.get('description', ''))
-        
-        article['title'] = title
-        article['description'] = description
-        
-        combined_text = f"{title} {description}"
-        sentiment = analyze_news_sentiment(combined_text)
-        article['sentiment'] = sentiment
-    
-    # Calculate overall sentiment
-    avg_sentiment = sum(a['sentiment']['score'] for a in articles) / len(articles)
-    
-    # Display overall sentiment metrics
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric('Total Articles', len(articles))
-    with col2:
-        sentiment_label = '🟢 Positive' if avg_sentiment > 0.2 else '🔴 Negative' if avg_sentiment < -0.2 else '🟡 Neutral'
-        st.metric('Overall Sentiment', sentiment_label)
-    with col3:
-        positive_count = sum(1 for a in articles if a['sentiment']['score'] > 0.3)
-        st.metric('Positive News', f"{positive_count}/{len(articles)}")
-    
-    st.markdown('---')
-    
-    # Display articles
-    for i, article in enumerate(articles, 1):
-        title = article.get('title', 'No title')
-        
-        # Add source badge to title
-        news_source_badge = ""
-        if article.get('news_source') == 'Bing':
-            news_source_badge = " 🅱️"
-        elif article.get('news_source') == 'Google':
-            news_source_badge = " 🔍"
-        
-        with st.expander(f"📄 {title}{news_source_badge}", expanded=(i <= 3)):
-            
-            # Sentiment badge
-            sentiment = article['sentiment']
-            st.markdown(f"**Sentiment:** {sentiment['label']} (Score: {sentiment['score']:.2f})")
-            
-            # Article details
-            col1, col2 = st.columns([3, 1])
-            
-            with col1:
-                source = article.get('source', 'Unknown')
-                if isinstance(source, dict):
-                    source = source.get('name', 'Unknown')
-                st.markdown(f"**Source:** {source}")
-                
-                if article.get('publishedAt'):
-                    pub_date = article['publishedAt']
-                    if isinstance(pub_date, str):
-                        try:
-                            if 'T' in pub_date:
-                                pub_date = datetime.strptime(pub_date.split('.')[0], '%Y-%m-%d %H:%M:%S').strftime('%B %d, %Y at %I:%M %p')
-                            else:
-                                pub_date = datetime.strptime(pub_date, '%Y-%m-%d %H:%M:%S').strftime('%B %d, %Y at %I:%M %p')
-                        except:
-                            pub_date = pub_date.split('T')[0] if 'T' in pub_date else pub_date
-                    st.markdown(f"**Published:** {pub_date}")
-            
-            with col2:
-                if article.get('url'):
-                    st.markdown(f"[🔗 Read More]({article['url']})")
-            
-            # Description
-            description = article.get('description', 'No description available.')
-            if description and description != 'No description available.' and len(description) > 10:
-                if len(description) > 500:
-                    description = description[:497] + '...'
-                st.markdown(f"_{description}_")
-            
-            st.markdown('---')
+    # Default to US exchanges if no suffix
+    return ticker, 'US'
 
 # Add this helper function after the imports section
 def clean_html_text(text: str) -> str:
