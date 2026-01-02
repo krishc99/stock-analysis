@@ -3197,11 +3197,36 @@ def main() -> None:
             successful = 0
             failed = 0
 
+            # --- MODIFIED SCANNER LOOP ---
             for idx, ticker_symbol in enumerate(stocks_to_analyze):
                 status_text.text(f"Processing {idx+1}/{len(stocks_to_analyze)}: {ticker_symbol}")
                 progress_bar.progress((idx) / len(stocks_to_analyze))
 
-                # Use the existing run_single_ticker_analysis function
+                # 1. CHECK IF ANALYZED IN LAST 30 MINUTES
+                skip_ticker = False
+                if os.path.exists(SUMMARY_FILE):
+                    temp_summary = pd.read_csv(SUMMARY_FILE)
+                    # Filter for this specific ticker
+                    ticker_row = temp_summary[temp_summary['Ticker'] == ticker_symbol]
+                    
+                    if not ticker_row.empty:
+                        last_updated_str = ticker_row.iloc[0]['Last Updated']
+                        try:
+                            last_updated_dt = datetime.strptime(last_updated_str, '%Y-%m-%d %H:%M:%S')
+                            time_diff = datetime.now() - last_updated_dt
+                            
+                            if time_diff < timedelta(minutes=30):
+                                skip_ticker = True
+                                logging.info(f"Skipping {ticker_symbol}: Analyzed {time_diff.seconds // 60} mins ago.")
+                        except Exception as e:
+                            logging.error(f"Error checking timestamp for {ticker_symbol}: {e}")
+
+                if skip_ticker:
+                    with results_container:
+                        st.caption(f"⏭️ Skipping **{ticker_symbol}** (Analyzed recently)")
+                    continue # Move to next ticker immediately without sleeping
+
+                # 2. RUN ANALYSIS (If not skipped)
                 with results_container:
                     try:
                         run_single_ticker_analysis(
@@ -3209,12 +3234,16 @@ def main() -> None:
                             start_date=scan_start_date,
                             end_date=scan_end_date,
                             interval=interval,
-                            analysis_index=idx # <--- ADD THIS
+                            analysis_index=idx
                         )
                         successful += 1
+                        # Only sleep if we actually made a request
+                        if idx < len(stocks_to_analyze) - 1:
+                            time.sleep(5) 
                     except Exception as e:
                         st.error(f"Failed to analyze {ticker_symbol}: {e}")
                         failed += 1
+            # --- END MODIFIED LOOP ---
 
                 # CRITICAL: Longer delay between stocks to avoid rate limiting
                 if idx < len(stocks_to_analyze) - 1:  # Don't delay after last stock
